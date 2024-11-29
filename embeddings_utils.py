@@ -1,165 +1,178 @@
-from PrimeKG_analysis import *
 import sys
 sys.path.append('..')
-from PrimeKG_utils import *
 import math
+import networkx as nx
+from collections import deque
 
-def dfs_to_graph_direct_acyclic(nodes, edges):
-    graph = ig.Graph()
-
-    graph.add_vertices(nodes['node_idx'])
-    for attribute in nodes.columns:
-        graph.vs[attribute] = nodes[attribute]
-        
-    edge_index = create_primekg_edge_index(edges)
-    graph.add_edges([tuple(x) for x in edge_index])
-    for attribute in edges.columns:
-        graph.es[attribute] = edges[attribute]
-
-    graph = graph.as_directed(mode='acyclic')
-
-    return graph
+def add_node_types(edges, nodes):
+    edges_with_node_type = edges.merge(nodes[['name', 'type']], left_on='subject', right_on='name', how='left')
+    edges_with_node_type = edges_with_node_type.rename(columns={'type': 'x_type'}).drop(columns=['name'])
+    edges_with_node_type = edges_with_node_type.merge(nodes[['name', 'type']], left_on='object', right_on='name', how='left')
+    edges_with_node_type = edges_with_node_type.rename(columns={'type': 'y_type'}).drop(columns=['name'])
+    return edges_with_node_type
 
 
 
 def annotated_disease(G):
-   
-    # Identify all disease nodes
-    disease_nodes = [node.index for node in G.vs if node['node_type'] == 'disease']
-    
-    # Calculate number of disease annotated to each node directly
-    for node in G.vs:
-        if node.index in disease_nodes:
-            continue  # Skip calculating IC for disease nodes themselves
+    """
+    Annotates each node in a NetworkX graph with a list of directly associated disease nodes.
+
+    Parameters:
+        G (nx.DiGraph): A NetworkX graph with nodes having a 'node_type' attribute.
+
+    Returns:
+        G (nx.DiGraph): The graph with an 'annotated_disease' attribute added to each node.
+    """
+
+    for node in G.nodes():
+        if G.nodes[node].get("node_type") == "Disease":
+            continue
         
-        node['annotated_disease'] = []
-        # Get neighbors of the current node
-        neighbors = G.neighbors(node.index, mode="all")
+        nx.set_node_attributes(G, {node: []}, "annotated_disease")
+        successors = list(G.successors(node))
+
+        associated_diseases = [
+            succ for succ in successors 
+            if G.nodes[succ].get("node_type") == "Disease"
+        ]
         
-        # Identify neighbors that are diseases
-        associated_diseases = [neighbor for neighbor in neighbors if neighbor in disease_nodes]
-        for disease in associated_diseases:
-            if disease not in node['annotated_disease']:
-                node['annotated_disease'].append(disease)
+        # Annotate the current node with its associated diseases
+        G.nodes[node]["annotated_disease"] = associated_diseases
 
     return G
 
 
-def get_childeren(G, node_type):
-    phenotypes = []
-    phenotypes = [node for node in G.vs if node['node_type'] == node_type]
 
+def get_children(G, node_type):
+    """
+    Annotates nodes of a specified type with their children in a NetworkX graph.
+
+    Parameters:
+        G (nx.DiGraph): A NetworkX directed graph.
+        node_type (str): The type of nodes to process (e.g., 'Phenotype').
+
+    Returns:
+        G (nx.DiGraph): The graph with a 'children' attribute added to nodes.
+    """
+    # Get all nodes of the specified type
+    phenotypes = [node for node, data in G.nodes(data=True) if data.get("node_type") == node_type]
+    
     for node in phenotypes:
-        node["children"] = []
+        # Initialize the "children" attribute
+        G.nodes[node]["children"] = []
+        
+        # Populate the "children" attribute with predecessors of the current node that are also phenotypes
+        for pre in G.predecessors(node):
+            if G.nodes[pre].get("node_type") == node_type and pre not in G.nodes[node]["children"]:
+                G.nodes[node]["children"].append(pre)
+    
+    return G
 
-        # Populate the "children" attribute with the indices of successor nodes that are in phenotypes
-        for succ in G.successors(node.index):  # Use node.index here
-            if G.vs[succ] in phenotypes and G.vs[succ]['node_idx'] not in node['children']:  # Check if the successor is also in phenotypes
-                node["children"].append(G.vs[succ]["node_idx"])
-
-    return(G)
 
 def get_parents(G, node_type):
-    phenotypes = []
-    phenotypes = [node for node in G.vs if node['node_type'] == node_type]
+    """
+    Annotates nodes of a specified type with their parents in a NetworkX graph.
 
+    Parameters:
+        G (nx.DiGraph): A NetworkX directed graph.
+        node_type (str): The type of nodes to process (e.g., 'Phenotype').
+
+    Returns:
+        G (nx.DiGraph): The graph with a 'parents' attribute added to nodes.
+    """
+    # Get all nodes of the specified type
+    phenotypes = [node for node, data in G.nodes(data=True) if data.get("node_type") == node_type]
+    
     for node in phenotypes:
-        node["parents"] = []
+        # Initialize the "parents" attribute
+        G.nodes[node]["parents"] = []
+        
+        # Populate the "parents" attribute with successors of the current node that are also phenotypes
+        for succ in G.successors(node):
+            if G.nodes[succ].get("node_type") == node_type and succ not in G.nodes[node]["parents"]:
+                G.nodes[node]["parents"].append(succ)
+    
+    return G
 
-        # Populate the "parents" attribute with the indices of successor nodes that are in phe
-        for pre in G.predecessors(node.index):  # Use node.index here
-            if G.vs[pre] in phenotypes and G.vs[pre]['node_idx'] not in node['parents']:  # Check if the successor is also in phenotypes
-                node["parents"].append(G.vs[pre]["node_idx"])
-                
-    return(G)
-
-from collections import deque
 
 def calculate_nt(G, node_type):
     """
     Calculate n(t) values (disease counts including descendants) for each node
     in a directed acyclic graph, starting from leaf nodes.
-    
+
     Parameters:
-        G (igraph.Graph): A directed acyclic graph where nodes may be annotated with diseases.
-        
+        G (networkx.DiGraph): A directed acyclic graph where nodes may be annotated with diseases.
+        node_type (str): The type of nodes to process (e.g., 'Phenotype').
+
     Returns:
-        dict: A dictionary mapping each node_id to its n(t) value.
+        dict: A dictionary mapping each node ID to its n(t) value.
     """
-    # initiate an array of phenotypes
-    phenotypes = []
-    phenotypes = [node for node in G.vs if node['node_type'] == node_type]
+    # Step 1: Identify phenotype nodes
+    phenotypes = [node for node, attrs in G.nodes(data=True) if attrs.get('node_type') == node_type]
 
-    # step1: find the diseases which are directly annotated to each phenotype node
-    annotated_disease(G)
 
-    # find children and parents of each phenotype node
-    get_childeren(G, node_type)         
-    get_parents(G, node_type)
-
-    # Step 2: Identify leaf nodes with no child
-    queue=deque(
-        node for node in phenotypes
-        if len(node['children']) == 0
+    # Step 2: Identify leaf nodes with no children
+    queue = deque(
+        node for node in phenotypes if len(G.nodes[node]["children"]) == 0
     )
-    
-    # Initialize a visited set to avoid re-processing nodes
+
+    # step3: Initialize a visited set to avoid re-processing nodes
     visited = set(queue)
 
-    # Step 3: Bottom-up aggregation of disease counts
+    # Step 4: Bottom-up aggregation of disease counts
     while queue:
         node = queue.pop()
 
         # Process each parent of the current node
-        for parent_idx in node['parents']:
-            parent = G.vs[parent_idx]  # Retrieve the parent node object using the index
-
-            if parent not in queue:
-                queue.appendleft(parent)            
-            
+        for parent in G.nodes[node]["parents"]:
             if parent not in visited:
-                for disease in node["annotated_disease"]:
-                    if disease not in parent['annotated_disease']:
-                        parent['annotated_disease'].append(disease)
-            
-            # Add parent to the queue if all its children have been processed
-            all_children_visited = all(child in visited for child in parent['children'])
-            if all_children_visited and parent not in visited:
-                visited.appendleft(parent)
-    
-    # Step 4: Map results to node_id for clarity
-    nt_values = {node["node_id"]: len(node["annotated_disease"]) for node in phenotypes}
-    
+                for disease in G.nodes[node]["annotated_disease"]:
+                    if disease not in G.nodes[parent]["annotated_disease"]:
+                        G.nodes[parent]["annotated_disease"].append(disease)
+
+                # Add parent to the queue if all its children have been processed
+                all_children_visited = all(
+                    child in visited for child in G.nodes[parent]["children"]
+                )
+                if all_children_visited:
+                    queue.appendleft(parent)
+                    visited.add(parent)
+
+    # Step 5: Map results to node_id for clarity
+    nt_values = {
+        node: len(G.nodes[node]["annotated_disease"]) for node in phenotypes
+    }
+
     return nt_values
+
 
 def calculate_ic_values(G, nt_values):
     """
     Calculate the Information Content (IC) for each node associated with a disease in the graph.
     
     Parameters:
-        G (igraph.Graph): A graph with nodes of various types and relationships.
+        G (networkx.DiGraph): A directed graph with nodes of various types and relationships.
+        nt_values (dict): A dictionary mapping each node_id to its n(t) value.
         
     Returns:
         dict: A dictionary mapping each node_id to its IC value.
     """
     
-    disease = []
-    disease = [node for node in G.vs if node['node_type'] == "disease"]
-    N = len(disease)
-    
-    ic_values = {}
-    
-    # Calculate IC for each node connected to a disease
-    for key,value in nt_values.items():
-        node_id = key 
-        n_t = value
+    # Identify disease nodes
+    disease_nodes = [node for node, attrs in G.nodes(data=True) if attrs.get('node_type') == "Disease"]
+    N = len(disease_nodes)  # Total number of disease nodes
 
+    ic_values = {}
+
+    # Calculate IC for each node connected to a disease
+    for node_id, n_t in nt_values.items():
         if n_t > 0:
             ic_values[node_id] = -math.log(n_t / N)
         else:
             ic_values[node_id] = 0.0  # If no associated diseases, IC is set to 0
     
     return ic_values
+
 
 def get_weights(IC_values, l, e):
     weights ={}
